@@ -1,17 +1,28 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 use log::{warn, info};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::fmt;
 use vst3_sys::base::{kResultOk, IPluginBase};
-use vst3_sys::vst::{IAudioProcessor, IComponent, ProcessSetup, SymbolicSampleSizes};
+use vst3_sys::vst::{IAudioProcessor, IComponent, IComponentHandler, IEditController, ProcessSetup, SymbolicSampleSizes};
+use vst3_sys::utils::SharedVstPtr;
 use vst3_sys::{ComInterface, VstPtr};
+use crate::component_handler::ComponentHandler;
 use crate::module::Module;
 use crate::plugin_descriptor::PluginDescriptor;
+use crate::shared::Shared;
+use crate::MainThreadMessage;
 
 pub struct Plugin {
     pub descriptor: Arc<PluginDescriptor>,
     pub component: VstPtr<dyn IComponent>,
     pub processor: Option<VstPtr<dyn IAudioProcessor>>,
+    pub edit_controller: Option<VstPtr<dyn IEditController>>,
+    pub shared: Arc<Shared>,
+    // Retenido para que el `ComponentHandler` no se libere: el plugin solo
+    // guarda un puntero COM crudo hacia él (vía `SharedVstPtr`), no un `Box`
+    // propio. Si soltamos este `Box` antes que el plugin, el puntero que
+    // sostiene queda colgando.
+    _component_handler: Box<ComponentHandler>,
 }
 
 impl fmt::Debug for Plugin {
@@ -47,7 +58,51 @@ impl Plugin {
             None => warn!("{}: El componente no expone la interfaz de procesamiento de audio", descriptor.name),
         }
 
-        Ok(Self { descriptor, component, processor })
+        // El sender queda huérfano por ahora: nadie del lado GUI todavía
+        // instancia un `Vst3Host` que drene el receiver correspondiente.
+        // Igual que en ClapHost, ese receiver se conecta cuando exista
+        // Vst3Host::plugin_add.
+        let (sender, _receiver) = mpsc::channel::<MainThreadMessage>();
+        let shared = Arc::new(Shared::new((*descriptor).clone(), sender));
+
+        let edit_controller = component.cast::<dyn IEditController>();
+        let component_handler = ComponentHandler::new(Arc::clone(&shared));
+
+        match &edit_controller {
+            Some(edit_controller) => {
+                let handler_ptr = component_handler.as_ref() as *const ComponentHandler
+                    as *mut *mut <dyn IComponentHandler as ComInterface>::VTable;
+
+                // SAFETY: `handler_ptr` apunta al campo `vtable` de nuestro
+                // `ComponentHandler`, que es `#[repr(C)]` con la vtable como
+                // primer campo — el mismo layout que exige `ComInterface`.
+                // `SharedVstPtr` es `#[repr(transparent)]` sobre exactamente
+                // este puntero, así que el transmute preserva el layout.
+                let shared_ptr: SharedVstPtr<dyn IComponentHandler> =
+                    unsafe { std::mem::transmute(handler_ptr) };
+
+                let res = unsafe { edit_controller.set_component_handler(shared_ptr) };
+                if res != kResultOk {
+                    warn!(
+                        "{}: set_component_handler() devolvió {res}, el plugin puede no recibir restart_component",
+                        descriptor.name
+                    );
+                }
+            }
+            None => warn!(
+                "{}: el componente no expone IEditController, no se puede instalar IComponentHandler",
+                descriptor.name
+            ),
+        }
+
+        Ok(Self {
+            descriptor,
+            component,
+            processor,
+            edit_controller,
+            shared,
+            _component_handler: component_handler,
+        })
     }
 
     pub fn prepare_to_play(&self, sample_rate: f64, max_samples_per_block: i32) -> Result<(), String> {
